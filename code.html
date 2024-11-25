@@ -1,0 +1,252 @@
+const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+const multer = require('multer');
+const ffmpeg = require('fluent-ffmpeg');
+const path = require('path');
+const fs = require('fs');
+
+// Initialize express and HTTP server
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server);
+
+// Set up file upload configuration
+const upload = multer({ dest: 'uploads/' });
+
+// Serve static content (CSS/JS) in this single file
+app.get('/', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Video Chat & Screen Sharing</title>
+      <style>
+        body {
+          font-family: Arial, sans-serif;
+          display: flex;
+          justify-content: center;
+          align-items: center;
+          height: 100vh;
+          margin: 0;
+          flex-direction: column;
+          background-color: #f0f0f0;
+        }
+        video {
+          width: 300px;
+          height: 200px;
+          border: 1px solid #000;
+          margin: 10px;
+        }
+        button {
+          margin: 10px;
+          padding: 10px;
+          background-color: #4CAF50;
+          color: white;
+          border: none;
+          cursor: pointer;
+        }
+        button:hover {
+          background-color: #45a049;
+        }
+        input[type="file"] {
+          margin: 10px;
+        }
+      </style>
+    </head>
+    <body>
+      <h1>Real-Time Video Chat and Screen Sharing</h1>
+      <video id="localVideo" autoplay muted></video>
+      <video id="remoteVideo" autoplay></video>
+
+      <button id="startCall">Start Call</button>
+      <button id="screenShare">Share Screen</button>
+      <button id="stopShare">Stop Screen Sharing</button>
+
+      <h3>Upload Video for Conversion</h3>
+      <input type="file" id="uploadVideo" accept="video/*">
+      <button id="convertVideo">Convert Video</button>
+
+      <div id="videoConversionMessage"></div>
+
+      <script src="/socket.io/socket.io.js"></script>
+      <script>
+        const socket = io();
+        let localStream, peerConnection;
+        const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+        const startCallButton = document.getElementById('startCall');
+        const screenShareButton = document.getElementById('screenShare');
+        const stopShareButton = document.getElementById('stopShare');
+        const uploadVideo = document.getElementById('uploadVideo');
+        const convertVideoButton = document.getElementById('convertVideo');
+        const videoConversionMessage = document.getElementById('videoConversionMessage');
+        const localVideo = document.getElementById('localVideo');
+        const remoteVideo = document.getElementById('remoteVideo');
+
+        // Function to start local video stream
+        async function startLocalStream() {
+          try {
+            localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+            localVideo.srcObject = localStream;
+          } catch (err) {
+            console.log('Error accessing media devices: ', err);
+          }
+        }
+
+        // Start call function
+        startCallButton.onclick = async function() {
+          await startLocalStream();
+          peerConnection = new RTCPeerConnection(config);
+          localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+
+          peerConnection.onicecandidate = event => {
+            if (event.candidate) {
+              socket.emit('ice-candidate', event.candidate);
+            }
+          };
+
+          peerConnection.ontrack = event => {
+            remoteVideo.srcObject = event.streams[0];
+          };
+
+          const offer = await peerConnection.createOffer();
+          await peerConnection.setLocalDescription(offer);
+          socket.emit('offer', offer);
+        };
+
+        // Handle incoming offers
+        socket.on('offer', async (offer) => {
+          await startLocalStream();
+          peerConnection = new RTCPeerConnection(config);
+          localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+
+          peerConnection.onicecandidate = event => {
+            if (event.candidate) {
+              socket.emit('ice-candidate', event.candidate);
+            }
+          };
+
+          peerConnection.ontrack = event => {
+            remoteVideo.srcObject = event.streams[0];
+          };
+
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+          const answer = await peerConnection.createAnswer();
+          await peerConnection.setLocalDescription(answer);
+          socket.emit('answer', answer);
+        });
+
+        // Handle incoming answers
+        socket.on('answer', (answer) => {
+          peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+        });
+
+        // Handle incoming ICE candidates
+        socket.on('ice-candidate', (candidate) => {
+          peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+        });
+
+        // Screen sharing functionality
+        screenShareButton.onclick = async () => {
+          try {
+            const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+            localVideo.srcObject = screenStream;
+            screenStream.getTracks().forEach(track => peerConnection.addTrack(track, screenStream));
+          } catch (err) {
+            console.log('Error sharing screen: ', err);
+          }
+        };
+
+        stopShareButton.onclick = () => {
+          let tracks = localVideo.srcObject.getTracks();
+          tracks.forEach(track => track.stop());
+          localVideo.srcObject = null;
+        };
+
+        // Video upload and conversion functionality
+        convertVideoButton.onclick = () => {
+          const videoFile = uploadVideo.files[0];
+          if (videoFile) {
+            videoConversionMessage.innerText = 'Converting video...';
+
+            const formData = new FormData();
+            formData.append('video', videoFile);
+
+            fetch('/convert', {
+              method: 'POST',
+              body: formData,
+            })
+            .then(response => response.blob())
+            .then(blob => {
+              const url = URL.createObjectURL(blob);
+              videoConversionMessage.innerText = 'Conversion complete!';
+              const downloadLink = document.createElement('a');
+              downloadLink.href = url;
+              downloadLink.download = 'converted-video.mp4';
+              downloadLink.innerText = 'Download Converted Video';
+              document.body.appendChild(downloadLink);
+            })
+            .catch(error => {
+              videoConversionMessage.innerText = 'Error converting video';
+              console.error('Error:', error);
+            });
+          } else {
+            videoConversionMessage.innerText = 'Please select a video file first.';
+          }
+        };
+      </script>
+    </body>
+    </html>
+  `);
+});
+
+// Video conversion route
+app.post('/convert', upload.single('video'), (req, res) => {
+  const inputVideo = req.file.path;
+  const outputVideo = path.join('uploads', 'output.mp4');
+
+  // Convert video using FFmpeg
+  ffmpeg(inputVideo)
+    .output(outputVideo)
+    .on('end', () => {
+      console.log('Conversion finished');
+      res.download(outputVideo, 'converted-video.mp4', () => {
+        fs.unlinkSync(inputVideo); // Clean up input file after conversion
+        fs.unlinkSync(outputVideo); // Clean up output file
+      });
+    })
+    .on('error', (err) => {
+      console.log('Error during conversion:', err);
+      res.status(500).send('Error during video conversion');
+    })
+    .run();
+});
+
+// WebSocket signaling for WebRTC (video chat)
+io.on('connection', (socket) => {
+  console.log('User connected');
+
+  socket.on('offer', (offer) => {
+    socket.broadcast.emit('offer', offer);
+  });
+
+  socket.on('answer', (answer) => {
+    socket.broadcast.emit('answer', answer);
+  });
+
+  socket.on('ice-candidate', (candidate) => {
+    socket.broadcast.emit('ice-candidate', candidate);
+  });
+
+  socket.on('disconnect', () => {
+    console.log('User disconnected');
+  });
+});
+
+// Start the server
+server.listen(3000, () => {
+  console.log('Server running on http://localhost:3000');
+});
